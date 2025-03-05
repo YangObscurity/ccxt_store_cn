@@ -1,0 +1,2 @@
+# bt-ccxt-store-cn
+backtrader是一个非常好的开源量化回测平台,我自己也时常用它,backtrader也能接入实盘,而[bt-ccxt-store](https://github.com/Dave-Vallance/bt-ccxt-store)就是帮助backtrader接入数字货币实盘交易的一个插件,但是bt-ccxt-store的某些实现并不是很好,无节制的网络轮询,一些细节考虑也不是很周到,比如订单处理部分,像接入火币,OKEX等平台的时候也有问题. 所以这里对原项目进行了大量修改,方便使用. [原项目地址](https://github.com/Dave-Vallance/bt-ccxt-store)

@@ -1,0 +1,7 @@
+backtrader==1.9.78.122
+ccxt==4.2.6
+pandas==2.1.4
+dash==2.14.2
+cachetools==5.3.2
+tqdm==4.66.1
+tenacity==8.2.3
