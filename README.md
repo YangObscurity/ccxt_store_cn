@@ -135,7 +135,7 @@ monitor.run(
 )
 ```
 ## 📊 可视化功能
-# 访问 ` http://localhost:8050 ` 查看实时仪表板：
+### 访问 ` http://localhost:8050 ` 查看实时仪表板：
 
 - 实时行情：多品种价格走势对比
 
@@ -162,7 +162,7 @@ best_params = optimizer.run(
     commission=0.001
 )
 ```
-# 风险管理
+### 风险管理
 ```python
 from risk_manager import PortfolioOptimizer
 
@@ -174,7 +174,7 @@ weights = optimizer.calculate(
 )
 ```
 ## 📚 开发指南
-# 扩展策略
+### 扩展策略
 ```python
 class MyCustomStrategy(bt.Strategy):
     params = (
@@ -190,7 +190,7 @@ class MyCustomStrategy(bt.Strategy):
         if self.volatility[0] > 0.1:
             self.order_target_percent(target=0.9)
 ```
-# 数据接入
+### 数据接入
 ```python
 from data_feeds import CustomDataFeed
 
@@ -338,7 +338,7 @@ monitor.run(
 )
 ```
 ## 📊 Visualization
-# Access real-time dashboard at `http://localhost:8050`:
+### Access real-time dashboard at `http://localhost:8050`:
 
 - Market Monitor: Multi-asset price comparison
 
@@ -349,7 +349,7 @@ monitor.run(
 - Signal Tracking: Historical trade signal replay
 
 ## 🔧 Advanced Features
-# Backtesting Engine
+### Backtesting Engine
 ```python
 from backtest_engine import Optimizer
 
@@ -366,7 +366,7 @@ best_params = optimizer.run(
     commission=0.001
 )
 ```
-# Risk Management
+### Risk Management
 ```python
 from risk_manager import PortfolioOptimizer
 
@@ -378,7 +378,7 @@ weights = optimizer.calculate(
 )
 ```
 ## 📚 Development Guide
-# Custom Strategy
+### Custom Strategy
 ```python
 class MyCustomStrategy(bt.Strategy):
     params = (
@@ -394,7 +394,7 @@ class MyCustomStrategy(bt.Strategy):
         if self.volatility[0] > 0.1:
             self.order_target_percent(target=0.9)
 ```
-# Data Integration
+### Data Integration
 ```python
 from data_feeds import CustomDataFeed
 
