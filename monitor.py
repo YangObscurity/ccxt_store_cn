@@ -76,4 +76,9 @@ if __name__ == '__main__':
 
     except Exception as e:
         temp_logger.error(f"初始化失败: {str(e)}", exc_info=True)
+        try:  # 新增安全退出逻辑
+            if 'monitor' in locals():
+                monitor.shutdown()
+        except:
+            pass
         sys.exit(1)

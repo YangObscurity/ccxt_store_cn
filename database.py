@@ -2,6 +2,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from logger import logger
 import time
+from config import ConfigManager
 
 def _delete_old_data(conn, table: str, days: int):
     """分块删除旧数据"""

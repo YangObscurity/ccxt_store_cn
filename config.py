@@ -36,6 +36,24 @@ class ConfigManager:
             'monitor': ['rsi_period', 'ma_period', 'atr_period']
         }
 
+        bool_fields = [
+            'gap_fill.enabled',
+            'historical_fill.enabled',
+            'logging.debug',
+            'logging.log_api_requests',
+            'sandbox',
+            'enable_visualization'
+        ]
+        
+        for field in bool_fields:
+            keys = field.split('.')
+            temp = self.config
+            for key in keys[:-1]:
+                temp = temp.get(key, {})
+            value = temp.get(keys[-1])
+            if not isinstance(value, bool):
+                raise ValueError(f"{field} 必须是布尔值")
+
         # 验证必需字段
         for field in required_fields:
             keys = field.split('.')
@@ -55,3 +73,4 @@ class ConfigManager:
         # 类型验证
         if not isinstance(self.config.get('sandbox', False), bool):
             raise ValueError("sandbox 必须是布尔值")
+        

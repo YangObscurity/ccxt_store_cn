@@ -21,6 +21,7 @@ class DataManager:
         self.cache = TTLCache(maxsize=200, ttl=600)
         self.db_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'data/tick.db'))
         self.symbol_metadata = {}
+        self.progress_queue = None
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         # 初始化数据库连接参数
         self.conn_params = {
@@ -63,7 +64,20 @@ class DataManager:
                         PRIMARY KEY(symbol, timestamp)
                     ) WITHOUT ROWID
                 ''')
-            
+            # 绘图数据表
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS plot_data (
+                    time INTEGER,
+                    symbol TEXT,
+                    timeframe TEXT,
+                    price REAL,
+                    ma REAL,
+                    rsi REAL,
+                    atr REAL,
+                    signals TEXT,
+                    PRIMARY KEY(symbol, timeframe, time)
+                )
+            ''')
             # 缺口表（保留缺口检测功能）
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS data_gaps (
@@ -101,50 +115,112 @@ class DataManager:
         valid = []
         min_ts = float('inf')
         max_ts = -float('inf')
-        
+        table = f'ohlcv_{timeframe}'
+        chunk_size = 500
+        saved = 0
+
+        # 时间戳标准化处理
         for row in data:
-            if self._validate_ohlcv_row(row):
-                ts = row[0]
-                min_ts = min(min_ts, ts)
-                max_ts = max(max_ts, ts)
-                valid.append((symbol, ts, *map(float, row[1:])))
-        
+            if len(row) != 6:
+                continue
+                
+            raw_ts = row[0]
+            # 自动识别时间戳格式
+            if 1e9 <= raw_ts < 1e10:    # 秒级时间戳
+                ts = int(raw_ts * 1000)
+            elif 1e12 <= raw_ts < 1e13:  # 毫秒级时间戳
+                ts = int(raw_ts)
+            else:
+                logger.warning(f"异常时间戳格式: {raw_ts}")
+                continue
+
+            # 数据有效性验证
+            o, h, l, c, v = map(float, row[1:])
+            if not (0 < o <= h and l <= c <= h and l > 0 and v >= 0):
+                logger.debug(f"无效数据行: {row}")
+                continue
+
+            valid.append((symbol, ts, o, h, l, c, v))
+            min_ts = min(min_ts, ts)
+            max_ts = max(max_ts, ts)
+
         if not valid:
             logger.warning(f"无有效数据可保存: {symbol} {timeframe}")
             return 0
-        
-        chunk_size = 500
-        saved = 0
-        table = f'ohlcv_{timeframe}'
-        
-        for i in range(0, len(valid), chunk_size):
-            chunk = valid[i:i+chunk_size]
-            try:
-                with sqlite3.connect(**self.conn_params) as conn:
+
+        # 分块写入数据库
+        try:
+            conn = sqlite3.connect(**self.conn_params)
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA synchronous=NORMAL')
+
+            for i in range(0, len(valid), chunk_size):
+                chunk = valid[i:i+chunk_size]
+                try:
+                    # 批量插入数据
                     conn.executemany(
-                        f'INSERT OR REPLACE INTO {table} VALUES (?,?,?,?,?,?,?)',
+                        f'''INSERT OR REPLACE INTO {table}
+                            (symbol, timestamp, open, high, low, close, volume)
+                            VALUES (?,?,?,?,?,?,?)''',
                         chunk
                     )
+                    
+                    # 更新元数据
                     conn.execute('''
-                        UPDATE symbol_metadata SET
-                            first_ts = COALESCE(?, first_ts),
-                            last_ts = COALESCE(?, last_ts)
-                        WHERE symbol = ?
-                    ''', (min_ts, max_ts, symbol))
+                        INSERT OR REPLACE INTO symbol_metadata 
+                        (symbol, first_ts, last_ts, list_time)
+                        VALUES (
+                            ?,
+                            COALESCE((SELECT MIN(first_ts) FROM symbol_metadata WHERE symbol=?), ?),
+                            COALESCE((SELECT MAX(last_ts) FROM symbol_metadata WHERE symbol=?), ?),
+                            (SELECT list_time FROM symbol_metadata WHERE symbol=?)
+                        )
+                    ''', (symbol, symbol, min_ts, symbol, max_ts, symbol))
+                    
                     conn.commit()
                     saved += conn.total_changes
-            except sqlite3.IntegrityError as e:
-                logger.error(f"数据冲突: {str(e)}")
-            except sqlite3.OperationalError as e:
-                logger.error(f"数据库锁冲突: {str(e)}, 等待后重试...")
-                time.sleep(0.5)
-                raise
-            except Exception as e:
-                logger.error(f"数据库写入失败: {str(e)}")
-                raise
-        
-        logger.debug(f"成功保存{symbol} {timeframe}数据 {saved}条")
-        return saved
+                    logger.debug(f"已写入 {len(chunk)} 条数据到 {table}")
+
+                except sqlite3.IntegrityError as e:
+                    logger.error(f"数据冲突: {str(e)}")
+                    conn.rollback()
+                except sqlite3.OperationalError as e:
+                    if "locked" in str(e):
+                        logger.warning("数据库锁定，等待后重试...")
+                        time.sleep(0.5)
+                        conn.rollback()
+                        # 重试当前分块
+                        i -= chunk_size  
+                    else:
+                        raise
+
+            # 更新缓存
+            with self.metadata_lock:
+            # 直接从数据库获取最新值保证一致性
+                current_first = self.get_oldest_timestamp(symbol, timeframe) or float('inf')
+                current_last = self.get_last_timestamp(symbol, timeframe) or -float('inf')
+                
+                new_first = min(current_first, min_ts)
+                new_last = max(current_last, max_ts)
+                
+                # 强制类型转换
+                self.symbol_metadata[symbol] = {
+                    'first_ts': int(new_first),
+                    'last_ts': int(new_last),
+                    'list_time': self.symbol_metadata.get(symbol, {}).get('list_time')
+                }
+                logger.debug(f"元数据更新 {symbol}: {self.symbol_metadata[symbol]}")
+
+            logger.info(f"成功保存{symbol} {timeframe}数据 {saved}条")
+            return saved
+
+        except Exception as e:
+            logger.error(f"数据库写入失败: {str(e)}", exc_info=True)
+            conn.rollback()
+            return saved
+        finally:
+            if conn:
+                conn.close()
 
     def _validate_ohlcv_row(self, row: list) -> bool:
         if len(row) != 6:
@@ -161,7 +237,9 @@ class DataManager:
     def _get_symbol_metadata(self, symbol: str) -> dict:
         if symbol in self.symbol_metadata:
             return self.symbol_metadata[symbol]
-            
+        
+        # 增强初始化逻辑
+        default_ts = int(time.time() * 1000)
         with self.metadata_lock:
             with sqlite3.connect(**self.conn_params) as conn:
                 row = conn.execute('''
@@ -171,15 +249,34 @@ class DataManager:
                 ''', (symbol,)).fetchone()
                 
                 if row:
-                    meta = {'first_ts': row[0], 'last_ts': row[1], 'list_time': row[2]}
+                    # 处理数据库NULL值
+                    first_ts = row[0] if row[0] is not None else default_ts
+                    last_ts = row[1] if row[1] is not None else default_ts
+                    meta = {
+                        'first_ts': min(first_ts, last_ts),
+                        'last_ts': max(first_ts, last_ts),
+                        'list_time': row[2]
+                    }
+                    if row[0] is None or row[1] is None:
+                        logger.warning(f"修复元数据空值 {symbol}")
                 else:
                     list_time = self._fetch_list_time(symbol)
-                    meta = {'first_ts': None, 'last_ts': None, 'list_time': list_time}
+                    meta = {
+                        'first_ts': default_ts,
+                        'last_ts': default_ts,
+                        'list_time': list_time
+                    }
                     conn.execute('''
-                        INSERT INTO symbol_metadata (symbol, first_ts, last_ts, list_time)
+                        INSERT INTO symbol_metadata 
+                        (symbol, first_ts, last_ts, list_time)
                         VALUES (?, ?, ?, ?)
-                    ''', (symbol, None, None, list_time))
+                    ''', (symbol, default_ts, default_ts, list_time))
                     conn.commit()
+                    logger.info(f"新建元数据记录 {symbol}")
+                
+                # 强制类型校验
+                meta['first_ts'] = int(meta['first_ts'])
+                meta['last_ts'] = int(meta['last_ts'])
                 self.symbol_metadata[symbol] = meta
                 return meta
            
@@ -234,14 +331,15 @@ class DataManager:
         saved_progress = self._get_sync_progress(symbol, timeframe)
         last_in_db = self.get_last_timestamp(symbol, timeframe)
         end_ts = min(last_in_db, end_ts) if last_in_db else end_ts
-        current_ts = saved_progress if saved_progress else end_ts  # 优先使用保存的进度
+        current_ts = saved_progress if saved_progress else end_ts
         
         logger.info(f"智能补全范围: {self._ts_to_str(actual_start_ts)} -> {self._ts_to_str(end_ts)}")
         
         success = False
+        retry_count = 0  # 新增重试计数器
         with self.hist_lock, tqdm(desc=f"📚 {symbol} {timeframe}", unit="页") as pbar:
             try:
-                while current_ts > actual_start_ts:
+                while current_ts > actual_start_ts and retry_count < 5:  # 最大重试5次
                     batch_start = max(current_ts - 1000 * tf_ms, actual_start_ts)
                     
                     data = self._safe_fetch_ohlcv(
@@ -251,7 +349,12 @@ class DataManager:
                     )
                     
                     if not data:
-                        break
+                        retry_count += 1
+                        logger.warning(f"空数据响应，重试计数: {retry_count}")
+                        time.sleep(2 ** retry_count)  # 指数退避
+                        continue
+                    
+                    retry_count = 0  # 重置计数器
                     
                     valid_data = [row for row in data if actual_start_ts <= row[0] <= end_ts]
                     if not valid_data or valid_data[0][0] >= current_ts:
@@ -260,13 +363,20 @@ class DataManager:
                     self.save_ohlcv_batch(symbol, timeframe, valid_data)
                     pbar.update(len(valid_data))
                     current_ts = self._align_ts(valid_data[0][0] - tf_ms, tf_ms)
-                    self._save_progress(symbol, timeframe, current_ts)  # 实时保存进度
+                    self._save_progress(symbol, timeframe, current_ts)
                     
                     time.sleep(max(0.3, self.store.exchange.rateLimit / 3000))
                 
-                oldest = self.get_oldest_timestamp(symbol, timeframe) or 0
-                latest = self.get_last_timestamp(symbol, timeframe) or 0
-                success = (oldest <= actual_start_ts) and (latest >= end_ts)
+                oldest = self.get_oldest_timestamp(symbol, timeframe)
+                latest = self.get_last_timestamp(symbol, timeframe)
+                if not oldest or not latest:
+                    success = False
+                else:
+                    tolerance = 7 * 86400_000
+                    success = (
+                        (oldest <= actual_start_ts + tolerance) and 
+                        (latest >= end_ts - tolerance)
+                    )
             except Exception as e:
                 logger.error(f"补全中断: {symbol} {timeframe} {str(e)}")
                 self._save_progress(symbol, timeframe, current_ts)
@@ -276,7 +386,7 @@ class DataManager:
             logger.info(f"补全完成: {symbol} {timeframe}")
             self._mark_as_repaired(symbol, timeframe)
         else:
-            logger.warning(f"数据不完整: {symbol} {timeframe}")
+            logger.warning(f"数据不完整: {symbol} {timeframe} 最新范围:{self._ts_to_str(oldest)}-{self._ts_to_str(latest)}")
     
     def _mark_as_repaired(self, symbol: str, timeframe: str):
         """标记数据已修复"""
@@ -311,15 +421,19 @@ class DataManager:
        wait=wait_fixed(2),
        retry=retry_if_exception_type((ccxt.NetworkError, ccxt.ExchangeError, KeyError)))
     def _safe_fetch_ohlcv(self, symbol: str, timeframe: str, since: int, limit: int):
-        """统一版数据获取方法（合并两个重复实现）"""
+        """数据获取方法"""
         retries = 0
         max_retries = 3
         tf_ms = self._timeframe_to_ms(timeframe)
         
         while retries < max_retries:
             try:
-                # 对齐时间戳避免分页错位
+                # 自动计算end时间戳
+                end = since + (limit * tf_ms)
+                
+                # 严格对齐时间戳
                 aligned_since = self._align_ts(since, tf_ms)
+                aligned_end = self._align_ts(end, tf_ms)
                 
                 data = self.store.exchange.fetch_ohlcv(
                     symbol,
@@ -329,32 +443,38 @@ class DataManager:
                     params={'instType': 'SPOT'}
                 )
                 
-                if not data:
-                    return []
-
-                # 严格验证时间序列和范围（关键修改）
-                expected_max_ts = aligned_since + (limit * tf_ms)
-                prev_ts = None
-                for idx, row in enumerate(data):
-                    current_ts = row[0]
-                    if current_ts > expected_max_ts:
-                        raise ValueError(f"数据超出请求范围 {current_ts} > {expected_max_ts}")
-                    if prev_ts and current_ts <= prev_ts:
-                        raise ValueError(f"时间戳非递增 {prev_ts} -> {current_ts}")
-                    prev_ts = current_ts
+                # 增强时间序列验证
+                if data:
+                    prev_ts = data[0][0]
+                    for row in data[1:]:
+                        current_ts = row[0]
+                        if current_ts <= prev_ts:
+                            raise ValueError(f"时间戳非递增 {prev_ts} -> {current_ts}")
+                        if current_ts > aligned_end:
+                            raise ValueError(f"数据超出范围 {current_ts} > {aligned_end}")
+                        prev_ts = current_ts
 
                 return data
+            
             except ccxt.NetworkError as e:
                 logger.warning(f"网络错误({retries+1}/{max_retries}): {str(e)}")
                 time.sleep(2 ** retries)
                 retries += 1
+            
             except ccxt.ExchangeError as e:
                 logger.warning(f"交易所错误({retries+1}/{max_retries}): {str(e)}")
                 time.sleep(2 ** retries)
                 retries += 1
+            
+            except ccxt.RateLimitExceeded as e:
+                logger.warning(f"API频率限制触发，等待后重试: {str(e)}")
+                time.sleep(60)
+                return []
+            
             except Exception as e:
                 logger.error(f"数据获取失败: {str(e)}")
                 raise
+
         return []        
     
     def _start_writer_thread(self):
@@ -375,8 +495,7 @@ class DataManager:
 
     @staticmethod
     def _align_ts(ts: int, timeframe_ms: int) -> int:
-        """时间戳对齐"""
-        return (ts // timeframe_ms) * timeframe_ms
+        return ts if (ts % timeframe_ms == 0) else ((ts // timeframe_ms) + 1) * timeframe_ms
 
     @staticmethod
     def _timeframe_to_ms(timeframe: str) -> int:
@@ -401,15 +520,21 @@ class DataManager:
             ).fetchone()
             return row[0] if row else None
 
-    def check_and_fill_gaps(self, symbol: str, timeframe: str):
-        """最终版缺口处理"""
+    def check_and_fill_gaps(self, symbol: str, timeframe: str, start_ts: int = None, end_ts: int = None):
+        """缺口处理"""
         if not self._should_process(symbol, timeframe, 'gap'):
             return
 
         try:
-            with self.gap_lock:
+            with self.gap_lock:  # 使用with语句确保锁的释放
                 logger.info(f"🏗️ 启动缺口扫描: {symbol} {timeframe}")
-                gaps = self._precision_detect_gaps(symbol, timeframe)
+                
+                # 如果未指定范围则自动检测
+                if start_ts is None or end_ts is None:
+                    gaps = self._precision_detect_gaps(symbol, timeframe)
+                else:
+                    # 直接创建指定范围的缺口
+                    gaps = [(start_ts, end_ts)]
                 
                 # 有效性验证
                 valid_gaps = []
@@ -434,6 +559,8 @@ class DataManager:
                         if self._fill_single_gap(symbol, timeframe, start, end, pbar):
                             success_count += 1
                         pbar.update(1)
+                        if self._stop_event.is_set():  # 新增退出检查
+                            break
                     
                     status_msg = (
                         f"缺口处理完成 | 有效缺口: {len(valid_gaps)}个 | "
@@ -488,86 +615,89 @@ class DataManager:
         return [d for d in data if start <= d[0] <= end]
 
     def _precision_detect_gaps(self, symbol, tf):
-        """精确缺口检测"""
+        """精确缺口"""
         table = f'ohlcv_{tf}'
         step = self._timeframe_to_ms(tf)
         gaps = []
         current_ts = int(time.time() * 1000)
         
         with sqlite3.connect(**self.conn_params) as conn:
+            # 使用参数化查询防止SQL注入
             df = pd.read_sql(f'''
-                SELECT timestamp FROM {table}
-                WHERE symbol = '{symbol}'
-                AND timestamp <= {current_ts}
+                SELECT timestamp 
+                FROM {table}
+                WHERE symbol = ? 
+                AND timestamp <= ?
                 ORDER BY timestamp
-            ''', conn)
+            ''', conn, params=(symbol, current_ts))
             
             if len(df) < 2:
                 return []
             
             df['prev'] = df['timestamp'].shift(1)
             df['gap'] = df['timestamp'] - df['prev'] - step
-            anomalies = df[(df['gap'] > step * 1.1) & (df['gap'] < step * 1000)]
+            # 放宽缺口检测阈值
+            anomalies = df[(df['gap'] > step * 1.05) & (df['gap'] < step * 2000)]  # 从1.1改为1.05
             
             for _, row in anomalies.iterrows():
                 gap_start = int(row['prev'] + step)
                 gap_end = int(row['timestamp'] - step)
-                # 与当前时间对齐
+                # 过滤无效小缺口
+                if gap_end - gap_start < step * 2:  # 至少缺2根K线
+                    continue
                 gaps.append((
                     gap_start,
                     min(gap_end, current_ts)
                 ))
         
+        last_ts = df['timestamp'].iloc[-1]
+        if last_ts < current_ts - step:
+            gaps.append((
+                last_ts + step,
+                current_ts
+            ))
         return gaps
 
-    def _should_process(self, symbol: str, tf: str, process_type: str) -> bool:
-        """执行条件检查"""
-        config = ConfigManager().config
-        if symbol not in config['spot_symbols']:
-            return False
-        if process_type == 'gap' and not config.get('enable_gap_filling', False):
-            return False
-        if process_type == 'historical' and not config.get('enable_historical_fill', False):
-            return False
-        if not self.store.exchange.has['fetchOHLCV']:
-            return False
-        return True
        
     def save_plot_data(self, symbol: str, timeframe: str, data: dict):
-        """保存策略生成的绘图数据（原方法优化版）"""
         try:
-            if not data or len(data['time']) == 0:
-                logger.warning(f"空绘图数据: {symbol} {timeframe}")
-                return
-
             # 增强数据验证
-            required_fields = ['time', 'price', 'ma', 'rsi', 'atr']
-            for field in required_fields:
-                if field not in data or len(data[field]) == 0:
-                    raise ValueError(f"缺失必要字段: {field}")
+            required_fields = ['time', 'price', 'ma', 'rsi', 'atr', 'signals']
+            if not all(field in data for field in required_fields):
+                raise ValueError("缺失必要字段")
+                
+            if len({len(data[f]) for f in required_fields}) != 1:
+                raise ValueError("所有数据字段长度必须一致")
 
             df = pd.DataFrame({
                 'time': pd.to_datetime(data['time'], unit='ms', utc=True),
-                'price': data['price'],
-                'ma': data['ma'],
-                'rsi': data['rsi'],
-                'atr': data['atr'],
-                'signals': [str(s) if s else None for s in data.get('signals', [None]*len(data['time']))]
-            })
-            df['symbol'] = symbol
-            df['timeframe'] = timeframe
-            
-            # 使用批量写入队列
-            self.write_queue.put({
-                'type': 'plot',
                 'symbol': symbol,
                 'timeframe': timeframe,
-                'data': df
-            })
-            logger.debug(f"绘图数据进入队列: {symbol} {timeframe} {len(df)}条")
-            
+                'price': pd.to_numeric(data['price'], errors='coerce'),
+                'ma': pd.to_numeric(data['ma'], errors='coerce'),
+                'rsi': pd.to_numeric(data['rsi'], errors='coerce'),
+                'atr': pd.to_numeric(data['atr'], errors='coerce'),
+                'signals': data['signals']
+            }).dropna(subset=['price', 'ma', 'rsi'])
+
+            # 强制类型转换
+            df['time'] = df['time'].astype('datetime64[ms]')
+            numeric_cols = ['price', 'ma', 'rsi', 'atr']
+            df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+
+            # 使用事务写入
+            try:
+                self.write_queue.put({
+                    'type': 'plot',
+                    'symbol': symbol,
+                    'timeframe': timeframe,
+                    'data': df
+                }, block=True, timeout=10)
+            except queue.Full:
+                logger.warning(f"绘图数据队列已满，丢弃{symbol} {timeframe}数据")
+                
         except Exception as e:
-            logger.error(f"准备绘图数据失败: {str(e)}")
+            logger.error(f"准备绘图数据失败: {str(e)}", exc_info=True)
 
     def get_oldest_timestamp(self, symbol: str, timeframe: str) -> Optional[int]:
         """获取最早时间戳"""
@@ -624,28 +754,30 @@ class DataManager:
                     pass
     
     def ensure_data_range(self, symbol: str, timeframe: str) -> bool:
-        """确保数据满足策略需求"""
-        # 自动计算时间范围
+        # 精确计算毫秒时间戳
         now = int(time.time() * 1000)
         if timeframe == '1h':
-            required_start = now - 365 * 86400_000
+            required_start = now - (365 * 86400_000)  # 365天
         elif timeframe == '1m':
-            required_start = now - 30 * 86400_000
+            required_start = now - (30 * 86400_000)    # 30天
         else:
             return True
+
+        # 获取实际数据边界（增强空值处理）
+        oldest = self.get_oldest_timestamp(symbol, timeframe)
+        latest = self.get_last_timestamp(symbol, timeframe)
+        if not oldest or not latest:
+            logger.error(f"获取时间戳失败，强制全量补全")
+            return self._fill_range(symbol, timeframe, required_start, now)
         
-        # 获取实际数据边界
-        oldest = self.get_oldest_timestamp(symbol, timeframe) or required_start
-        latest = self.get_last_timestamp(symbol, timeframe) or now
+        # 动态调整要求（允许7天缺口）
+        tolerance = 7 * 86400_000
+        success = (oldest <= required_start + tolerance) and (latest >= now - tolerance)
         
-        # 执行双向补全
-        success = True
-        if oldest > required_start:
-            success &= self._fill_range(symbol, timeframe, required_start, oldest)
-        if latest < now:
-            success &= self._fill_range(symbol, timeframe, latest, now)
-        
-        return success
+        if not success:
+            logger.warning(f"数据范围异常 {symbol} {timeframe} | 现有范围: {self._ts_to_str(oldest)}-{self._ts_to_str(latest)} | 需求范围: {self._ts_to_str(required_start)}-{self._ts_to_str(now)}")
+            return self._fill_range(symbol, timeframe, required_start, now)
+        return True
     
     @staticmethod
     def _ts_to_str(ts: int) -> str:
@@ -657,28 +789,52 @@ class DataManager:
         current = end
         total = 0
         max_attempts = 1000
+        retry_count = 0
+        logger.info(f"强制补全范围: {self._ts_to_str(start)}->{self._ts_to_str(end)} 共{(end-start)/tf_ms}根K线")
         
-        with tqdm(total=(end - start) // tf_ms, desc=f"填充{symbol} {timeframe}") as pbar:
+        with tqdm(total=(end - start)//tf_ms + 1,  # 修正总数计算
+                 desc=f"紧急补全{symbol} {timeframe}") as pbar:
             for _ in range(max_attempts):
-                if current <= start:
+                if current < start:  # 修改终止条件
                     break
-                    
-                data = self._safe_fetch_ohlcv(symbol, timeframe, current - 1000*tf_ms, 1000)
-                if not data:
-                    break
-                    
-                valid = [d for d in data if start <= d[0] <= end]
-                if not valid:
-                    break
-                    
-                self.save_ohlcv_batch(symbol, timeframe, valid)
-                saved = len(valid)
-                total += saved
-                pbar.update(saved)
-                current = valid[0][0] - tf_ms
                 
-                time.sleep(max(0.5, self.store.exchange.rateLimit / 1000))
-                
+                try:
+                    data = self._safe_fetch_ohlcv(
+                        symbol, timeframe, 
+                        current - 1000*tf_ms, 
+                        1000
+                    )
+                    if not data:
+                        if retry_count > 3:
+                            break
+                        retry_count += 1
+                        continue
+                    
+                    # 扩展有效范围判断
+                    valid = [d for d in data if (start - tf_ms) <= d[0] <= end]
+                    if not valid:
+                        break
+                    
+                    # 更新当前指针时应使用最小时间戳
+                    current = min(d[0] for d in valid) - tf_ms
+                    self.save_ohlcv_batch(symbol, timeframe, valid)
+                    saved = len(valid)
+                    total += saved
+                    pbar.update(saved)
+                    retry_count = 0
+                    
+                    # 动态调整请求间隔
+                    delay = max(
+                        self.store.exchange.rateLimit / 1000, 
+                        0.5 if saved < 500 else 0.1
+                    )
+                    time.sleep(delay)
+                    
+                except Exception as e:
+                    logger.error(f"补全异常: {str(e)}")
+                    break
+
+        logger.info(f"补全完成，实际需求/写入: {(end-start)//tf_ms+1}/{total}")
         return total > 0
 
     def _validate_timestamp_continuity(self, symbol: str, timeframe: str):
@@ -868,18 +1024,22 @@ class DataManager:
  
     def _should_process(self, symbol: str, tf: str, process_type: str) -> bool:
         config = ConfigManager().config
-        if symbol not in config['spot_symbols']:
+    
+        # 严格检查品种白名单
+        if symbol not in config.get('spot_symbols', []):
             return False
-            
-        # 使用新的配置结构
+        
+        # 使用安全访问方式获取嵌套配置
         if process_type == 'gap':
-            return config['gap_fill'].get('enabled', False)
-            
-        if process_type == 'historical':
-            return config['historical_fill'].get('enabled', False)
-            
-        if not self.store.exchange.has['fetchOHLCV']:
-            return False
+            if not config.get('gap_fill', {}).get('enabled', False):
+                return False
+                
+        elif process_type == 'historical':
+            # 增加详细日志输出
+            enabled = config.get('historical_fill', {}).get('enabled', False)
+            logger.debug(f"历史补全检查 {symbol} {tf}: 配置状态={enabled}")
+            if not enabled:
+                return False
             
         return True
 
@@ -1003,25 +1163,54 @@ class DataManager:
         success = False
         
         try:
+            # 计算需要获取的K线数量
+            limit = ((end - start) // tf_ms) + 1  # 动态计算limit
+            
             while current <= end:
-                data = self._safe_fetch_ohlcv(symbol, tf, current, 1000)
+                # 精确对齐时间戳
+                aligned_current = self._align_ts(current, tf_ms)
+                
+                data = self._safe_fetch_ohlcv(
+                    symbol, 
+                    tf,
+                    since=aligned_current,
+                    limit=min(limit, 1000)  # 控制单次请求量
+                )
+                
                 if not data:
                     break
                 
-                valid = [d for d in data if start <= d[0] <= end]
+                # 严格过滤在缺口范围内的数据
+                valid = [row for row in data if start <= row[0] <= end]
                 if not valid:
                     break
+                    
+                # 保存数据并更新进度
+                saved = self.save_ohlcv_batch(symbol, tf, valid)
+                if saved > 0:
+                    pbar.update(saved)
+                    current = valid[-1][0] + tf_ms
+                    success = True
+                else:
+                    break
                 
-                self.save_ohlcv_batch(symbol, tf, valid)
-                pbar.update(len(valid))
-                current = valid[-1][0] + tf_ms
-                success = True
-            
-            return success
+                # 更新剩余需要获取的数量
+                limit -= len(valid)
+                
         except Exception as e:
             logger.error(f"补全缺口失败 {start}-{end}: {str(e)}")
             return False
         
+        # 二次验证缺口是否填补
+        with sqlite3.connect(**self.conn_params) as conn:
+            gap_count = conn.execute('''
+                SELECT COUNT(*) FROM data_gaps 
+                WHERE symbol=? AND timeframe=? 
+                AND start_ts=? AND end_ts=?
+            ''', (symbol, tf, start, end)).fetchone()[0]
+            
+        return gap_count == 0 and success
+    
     def _clean_processed_gaps(self, symbol: str, timeframe: str):
         """清理已处理或过期的缺口记录"""
         try:
@@ -1051,3 +1240,40 @@ class DataManager:
         except Exception as e:
             logger.error(f"清理缺口记录失败: {str(e)}")
 
+    def _convert_db_timestamp(self, ts: int) -> int:
+        """处理不同来源的时间戳格式"""
+        if 1e12 <= ts < 1e13:  # 毫秒级时间戳 (13位)
+            return ts
+        elif 1e9 <= ts < 1e10:  # 秒级时间戳 (10位)
+            return ts * 1000
+        else:
+            logger.warning(f"异常时间戳格式: {ts}")
+            return int(time.time() * 1000)  # 返回当前时间作为默认值
+        
+    def _validate_last_n_bars(self, symbol: str, timeframe: str, n: int = 3):
+        """验证最后n根K线的连续性"""
+        table = f'ohlcv_{timeframe}'
+        tf_ms = self._timeframe_to_ms(timeframe)
+        
+        with sqlite3.connect(**self.conn_params) as conn:
+            df = pd.read_sql_query(f'''
+                SELECT timestamp 
+                FROM {table} 
+                WHERE symbol = ? 
+                ORDER BY timestamp DESC 
+                LIMIT {n}
+            ''', conn, params=(symbol,))
+            
+        if len(df) < n:
+            return
+        
+        # 检查时间间隔
+        diffs = df['timestamp'].diff().abs().iloc[1:]
+        anomalies = diffs[diffs != tf_ms]
+        
+        if not anomalies.empty:
+            logger.warning(f"发现近期数据异常 {symbol} {timeframe}")
+            # 触发紧急补全
+            start = df['timestamp'].min() - tf_ms * 10  # 多补10根确保连续
+            end = df['timestamp'].max() + tf_ms
+            self.check_and_fill_gaps(symbol, timeframe, start, end)
