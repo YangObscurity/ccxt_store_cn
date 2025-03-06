@@ -1,5 +1,5 @@
 # BT-CCXT-Store-CN 量化交易框架
-
+#### (暂未开发完成)
 [English Version Below](#english-version)
 
 ## 概述
@@ -205,7 +205,7 @@ feed = CustomDataFeed(
 <a id="english-version"></a>
 
 # BT-CCXT-Store-CN Quantitative Trading Framework
-
+#### (PLEASE WAIT!I DIDN'T FINISH IT YET!)
 ## Overview
 
 A professional-grade cryptocurrency quantitative trading framework built on **CCXT** and **Backtrader**, optimized for global developers with special enhancements for Chinese network environments. Provides end-to-end solutions from data acquisition to strategy execution.
