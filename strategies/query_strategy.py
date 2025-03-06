@@ -1,9 +1,17 @@
 # query_strategy.py
 import logging
-from datetime import datetime
-from typing import Dict
+import os
+import sys
+from typing import Dict, Set, Tuple
 import backtrader as bt
 from backtrader import indicators as btind
+
+current_file_path = os.path.abspath(__file__).replace('\\', '/')
+root_dir = os.path.dirname(os.path.dirname(current_file_path))
+sys.path.insert(0, root_dir)
+from data_manager import DataManager
+from datetime import datetime, timedelta
+from collections import defaultdict
 
 class EnhancedQueryStrategy(bt.Strategy):
     params = (
@@ -20,98 +28,109 @@ class EnhancedQueryStrategy(bt.Strategy):
     def __init__(self):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.inds = {}
-        self.plot_data = {}
-        
+        self.plot_data = defaultdict(lambda: {
+            'time': [], 'price': [], 'ma': [], 'rsi': [], 'atr': [], 'signals': []
+        })
+        self.signals: Set[Tuple[str, int]] = set()
+
         for data in self.datas:
             if not hasattr(data, '_name') or not data._name:
-                self.logger.error(f"无效数据源: {repr(data)} 缺少名称属性")
                 continue
-            if len(data.close) < 1:
-                self.logger.error(f"空数据源: {data._name}")
+            if len(data.close) < self.params.ma_period:
                 continue
             
             try:
-                timeframe = '1h' if '1h' in data._name else '1m'
                 self.inds[data] = {
                     'ma': btind.SMA(data.close, period=self.params.ma_period),
                     'rsi': btind.RSI(data.close, period=self.params.rsi_period),
                     'atr': btind.ATR(data, period=self.params.atr_period)
                 }
-                self.logger.info(f"成功初始化指标: {data._name}")
-                
-                # 绘图数据存储
-                self.plot_data[data._name] = {
-                    'time': [],
-                    'price': [],
-                    'ma': [],
-                    'rsi': [],
-                    'atr': []
-                }
             except Exception as e:
-                self.logger.error(f"指标初始化失败 [{data._name}]: {str(e)}")
                 continue
 
     def next(self):
         for data, ind in self.inds.items():
-            # 确保有足够历史数据
-            if len(data) < self.params.min_history_bars:
-                # 获取最早数据时间
-                first_date = data.datetime.datetime(0)
-                required_date = datetime.now() - timedelta(days=30)
-                if first_date > required_date:
-                    self.logger.error(f"数据不足 {data._name}: 最早数据 {first_date}")
-                    return
-            self.evaluate_signals(data, ind)
-            self.record_plot_data(data)
-
-    def record_plot_data(self, data):
-        """记录绘图数据"""
-        name = data._name
-        self.plot_data[name]['time'].append(data.datetime.datetime())
-        self.plot_data[name]['price'].append(data.close[0])
-        self.plot_data[name]['ma'].append(self.inds[data]['ma'][0])
-        self.plot_data[name]['rsi'].append(self.inds[data]['rsi'][0])
-        self.plot_data[name]['atr'].append(self.inds[data]['atr'][0])
-
-    def evaluate_signals(self, data, ind):
-        try:
-            condition = (
-                (ind['rsi'][0] < self.params.oversold) and
-                (data.close[0] > ind['ma'][0]) and
-                (data.close[0] > data.close[-1] + ind['atr'][0])
-            )
+            if any([v[0] is None for v in ind.values()]):
+                continue
             
-            if condition:
-                self.log_signal(data, 'BUY', ind)
+            try:
+                condition = (
+                    (ind['rsi'][0] < self.params.oversold) and
+                    (data.close[0] > ind['ma'][0]) and
+                    (data.close[0] > data.close[-1] + ind['atr'][0])
+                )
+                if condition:
+                    self._log_signal(data, ind)
+                self._record_data(data)
+            except IndexError:
+                continue
+            
+    def _record_data(self, data):
+        try:
+            if data._name not in self.inds:
+                return
                 
-        except Exception as e:
-            self.logger.error(f"信号计算错误: {str(e)}")
+            ind = self.inds[data]
+            if any([v[0] is None for v in ind.values()]):
+                return
 
-    def log_signal(self, data, signal: str, ind: Dict):
-        dt = data.datetime.datetime()
+            plot_time = int(data.datetime.datetime().timestamp() * 1000)
+            self.plot_data[data._name]['time'].append(plot_time)
+            self.plot_data[data._name]['price'].append(float(data.close[0]))
+            self.plot_data[data._name]['ma'].append(float(ind['ma'][0]))
+            self.plot_data[data._name]['rsi'].append(float(ind['rsi'][0]))
+            self.plot_data[data._name]['atr'].append(float(ind['atr'][0]))
+            self.plot_data[data._name]['signals'].append(None)  # 占位符
+        except (KeyError, IndexError, AttributeError) as e:
+            self.logger.warning(f"数据记录失败: {str(e)}")
+
+    def _log_signal(self, data, ind):
+        plot_time = self.plot_data[data._name]['time'][-1]
+        self.signals.add((data._name.split('_')[0], plot_time))
+        
+        # 更新信号标记
+        last_idx = len(self.plot_data[data._name]['signals']) - 1
+        self.plot_data[data._name]['signals'][last_idx] = 'BUY'
+
         log_msg = (
-            f"{dt} | {data._name} | {signal} | "
+            f"{data.datetime.datetime()} | {data._name} | BUY | "
             f"Price: {data.close[0]:.2f} | "
             f"RSI: {ind['rsi'][0]:.2f} | "
             f"MA: {ind['ma'][0]:.2f} | "
             f"ATR: {ind['atr'][0]:.2f}"
         )
         self.logger.info(log_msg)
-        
-    def stop(self):
-        """策略结束时触发绘图"""
-        if self.params.enable_plot:
-            self.save_plot_data()
 
-    def save_plot_data(self):
-        """保存绘图数据到数据库"""
-        from monitor import DataManager
+
+    def stop(self):
+        if not self.params.enable_plot:
+            return
+            
         dm = DataManager()
         for symbol, data in self.plot_data.items():
             if not data['time']:
                 continue
-            dm.save_plot_data(
-                symbol=symbol.split('_')[0],
-                timeframe='1h' if '1h' in symbol else '1m',
-                data=data
-            )
+                
+            try:
+                clean_data = {
+                    'time': data['time'],
+                    'price': data['price'],
+                    'ma': data['ma'],
+                    'rsi': data['rsi'],
+                    'atr': data['atr'],
+                    'signals': [
+                        'BUY' if (symbol.split('_')[0], t) in self.signals else None 
+                        for t in data['time']
+                    ]
+                }
+                # 严格验证数据长度一致性
+                if not all(len(lst) == len(data['time']) for lst in [data['price'], data['ma'], data['rsi'], data['atr']]):
+                    raise ValueError("指标数据长度不一致")
+                    
+                dm.save_plot_data(
+                    symbol=symbol.split('_')[0],
+                    timeframe='1h' if '1h' in symbol else '1m',
+                    data=clean_data
+                )
+            except Exception as e:
+                self.logger.error(f"DATA SAVE FAILED [{symbol}]: {str(e)}")
